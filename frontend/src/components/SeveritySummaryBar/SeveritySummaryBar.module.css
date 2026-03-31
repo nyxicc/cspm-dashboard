@@ -1,0 +1,99 @@
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-6);
+  background-color: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.badges {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+.badgeWrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.tooltip {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: 220px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border);
+  border-top: 2px solid; /* color set via inline style */
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  padding: var(--space-3) var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.55;
+  z-index: 50;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  transform: translateX(-50%) translateY(-4px);
+}
+
+.badgeWrapper:hover .tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.tooltipLabel {
+  display: block;
+  font-weight: 700;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  margin-bottom: var(--space-1);
+  text-transform: capitalize;
+}
+
+.bigCount {
+  font-size: var(--text-2xl);
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Meta row — timestamp, duration, total */
+.meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.total strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.separator {
+  color: var(--text-muted);
+}
+
+/* Skeleton placeholders */
+.skeletonBadge {
+  width: 60px;
+  height: 48px;
+}
+
+.skeletonMeta {
+  width: 280px;
+  height: 16px;
+}

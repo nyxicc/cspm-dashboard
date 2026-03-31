@@ -1,0 +1,61 @@
+.card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid; /* color set via inline style from worstSeverity */
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  transition: background-color 0.15s ease;
+}
+
+.card:hover {
+  background-color: var(--bg-card-hover);
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.icon {
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.service {
+  font-size: var(--text-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.count {
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.count strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.clean {
+  color: var(--sev-low);
+  font-weight: 600;
+}
+
+.breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.badgeWrap {
+  transition: opacity 0.15s ease;
+}

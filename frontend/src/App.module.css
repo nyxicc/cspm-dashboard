@@ -1,0 +1,310 @@
+.layout {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ─────────────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-6);
+  padding: var(--space-5) var(--space-8);
+  background-color: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  /* Frosted glass effect on scroll */
+  backdrop-filter: blur(8px);
+  background-color: rgba(22, 27, 34, 0.92);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-shrink: 0;
+}
+
+.brandIcon {
+  font-size: 28px;
+  line-height: 1;
+}
+
+.brandName {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.brandSub {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 2px;
+}
+
+/* ── Main ───────────────────────────────────────────────────── */
+.main {
+  flex: 1;
+  max-width: 1440px;
+  width: 100%;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+/* ── Sections ───────────────────────────────────────────────── */
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.sectionTitle {
+  font-size: var(--text-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.sectionSub {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin-top: calc(var(--space-1) * -1); /* pull up closer to title */
+}
+
+/* ── Header right (summary bar + re-scan button) ────────────── */
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.rescanBtn {
+  appearance: none;
+  background-color: rgba(88, 166, 255, 0.08);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+  border-radius: var(--radius-md);
+  color: var(--border-focus);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  padding: var(--space-2) var(--space-4);
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.rescanBtn:hover:not(:disabled) {
+  background-color: rgba(88, 166, 255, 0.15);
+  border-color: rgba(88, 166, 255, 0.5);
+}
+
+.rescanBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Landing page ───────────────────────────────────────────── */
+.landing {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-8);
+}
+
+.landingCard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  max-width: 480px;
+  gap: var(--space-4);
+}
+
+.landingIcon {
+  font-size: 56px;
+  line-height: 1;
+  filter: drop-shadow(0 0 24px rgba(88, 166, 255, 0.3));
+}
+
+.landingTitle {
+  font-size: var(--text-3xl, 2rem);
+  font-weight: 800;
+  color: var(--text-primary);
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.landingDesc {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: 1.65;
+  max-width: 380px;
+}
+
+.scanBtn {
+  appearance: none;
+  margin-top: var(--space-2);
+  padding: var(--space-3) var(--space-8);
+  background: linear-gradient(135deg, #1f6feb 0%, #388bfd 100%);
+  border: none;
+  border-radius: var(--radius-md);
+  color: #ffffff;
+  cursor: pointer;
+  font-size: var(--text-base);
+  font-family: var(--font-sans);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  box-shadow: 0 0 24px rgba(56, 139, 253, 0.35);
+  transition: box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.scanBtn:hover {
+  box-shadow: 0 0 36px rgba(56, 139, 253, 0.55);
+  transform: translateY(-1px);
+}
+
+.scanBtn:active {
+  transform: translateY(0);
+}
+
+.landingHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* ── Credential form ────────────────────────────────────────── */
+.credForm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 520px;
+  margin-top: var(--space-2);
+}
+
+/* Two inputs side by side (key ID + secret) */
+.formRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.formGroup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.formLabel {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.formInput,
+.formSelect {
+  appearance: none;
+  background-color: var(--bg-card-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+  outline: none;
+  transition: border-color 0.15s ease;
+  width: 100%;
+}
+
+.formSelect {
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+
+.formInput::placeholder {
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+}
+
+.formInput:focus,
+.formSelect:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
+}
+
+.formOptional {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
+  margin-left: var(--space-1);
+  background: rgba(255,255,255,0.05);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* ── Header action buttons ──────────────────────────────────── */
+.headerActions {
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.changeCredsBtn {
+  appearance: none;
+  background-color: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-family: var(--font-sans);
+  font-weight: 500;
+  padding: var(--space-2) var(--space-3);
+  white-space: nowrap;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.changeCredsBtn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.changeCredsBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  .header {
+    padding: var(--space-4);
+    flex-direction: column;
+  }
+  .main {
+    padding: var(--space-4);
+    gap: var(--space-6);
+  }
+  .formRow {
+    grid-template-columns: 1fr;
+  }
+  .credForm {
+    max-width: 100%;
+  }
+}

@@ -1,0 +1,30 @@
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background-color: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+}
+
+.icon {
+  font-size: var(--text-lg);
+  color: var(--sev-critical);
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.heading {
+  font-weight: 600;
+  font-size: var(--text-base);
+  color: var(--sev-critical);
+}
+
+.message {
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
