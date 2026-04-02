@@ -86,7 +86,7 @@ export default function FindingsTable({ findings, loading, error }) {
               <tr>
                 <td colSpan={6} className={styles.empty}>
                   {findings.length === 0
-                    ? 'No findings detected — your account looks clean! 🎉'
+                    ? 'No findings detected — your account looks clean.'
                     : 'No findings match the selected filters.'}
                 </td>
               </tr>

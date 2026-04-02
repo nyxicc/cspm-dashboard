@@ -22,3 +22,10 @@ export const fetchSummary = (creds) => post('/api/findings/summary', creds);
 
 // fetchScan POSTs credentials to /api/scan.
 export const fetchScan = (creds) => post('/api/scan', creds);
+
+// fetchExplain POSTs a finding to /api/explain and returns { explanation }.
+export const fetchExplain = (finding) => post('/api/explain', finding);
+
+// fetchAttackPaths POSTs the findings array to /api/attack-paths and returns
+// { attack_paths: [...] }.
+export const fetchAttackPaths = (findings) => post('/api/attack-paths', { findings });

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -73,6 +74,12 @@ func (s *S3Scanner) Scan(ctx context.Context) ([]models.Finding, error) {
 		if f, err := s.checkVersioning(ctx, name); err == nil && f != nil {
 			findings = append(findings, *f)
 		}
+		if f, err := s.checkHTTPSPolicy(ctx, name); err == nil && f != nil {
+			findings = append(findings, *f)
+		}
+		if f, err := s.checkPublicACL(ctx, name); err == nil && f != nil {
+			findings = append(findings, *f)
+		}
 	}
 
 	return findings, nil
@@ -87,7 +94,7 @@ func (s *S3Scanner) Scan(ctx context.Context) ([]models.Finding, error) {
 // were a leading cause of S3 data breaches. All four settings must be true to
 // provide complete coverage.
 //
-// CIS AWS Foundations Benchmark: 2.1.5
+// CIS AWS Foundations Benchmark: 2.1.4
 func (s *S3Scanner) checkPublicAccessBlock(ctx context.Context, bucket string) (*models.Finding, error) {
 	out, err := s.client.GetPublicAccessBlock(ctx, &s3.GetPublicAccessBlockInput{
 		Bucket: aws.String(bucket),
@@ -104,7 +111,7 @@ func (s *S3Scanner) checkPublicAccessBlock(ctx context.Context, bucket string) (
 				"a permissive bucket policy or ACL can expose objects to the internet.",
 			"Enable all four Block Public Access settings on the bucket: "+
 				"BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, and RestrictPublicBuckets.",
-			"2.1.5",
+			"2.1.4",
 		), nil
 	}
 
@@ -125,7 +132,7 @@ func (s *S3Scanner) checkPublicAccessBlock(ctx context.Context, bucket string) (
 				"ACLs or bucket policies.",
 			"Enable all four Block Public Access settings: BlockPublicAcls, "+
 				"IgnorePublicAcls, BlockPublicPolicy, and RestrictPublicBuckets.",
-			"2.1.5",
+			"2.1.4",
 		), nil
 	}
 
@@ -172,7 +179,7 @@ func (s *S3Scanner) checkEncryption(ctx context.Context, bucket string) (*models
 // delivered to a separate, write-protected bucket so an attacker cannot cover
 // their tracks by deleting them.
 //
-// CIS AWS Foundations Benchmark: 2.1.2
+// Not a numbered CIS AWS v1.4 control — best practice for SOC2/HIPAA.
 func (s *S3Scanner) checkLogging(ctx context.Context, bucket string) (*models.Finding, error) {
 	out, err := s.client.GetBucketLogging(ctx, &s3.GetBucketLoggingInput{
 		Bucket: aws.String(bucket),
@@ -191,7 +198,7 @@ func (s *S3Scanner) checkLogging(ctx context.Context, bucket string) (*models.Fi
 				"incident investigation and compliance auditing impossible.",
 			"Enable server access logging on the bucket and deliver logs to a "+
 				"dedicated, write-protected logging bucket in the same region.",
-			"2.1.2",
+			"",
 		), nil
 	}
 
@@ -205,7 +212,7 @@ func (s *S3Scanner) checkLogging(ctx context.Context, bucket string) (*models.Fi
 // attacker overwrites or deletes objects). Without versioning, a single
 // s3:DeleteObject call permanently destroys data with no recovery path.
 //
-// CIS AWS Foundations Benchmark: 2.1.3
+// Not a numbered CIS AWS v1.4 control — best practice for ransomware resilience.
 func (s *S3Scanner) checkVersioning(ctx context.Context, bucket string) (*models.Finding, error) {
 	out, err := s.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(bucket),
@@ -225,7 +232,7 @@ func (s *S3Scanner) checkVersioning(ctx context.Context, bucket string) (*models
 				"This is exploited by ransomware that targets cloud storage.",
 			"Enable versioning on the bucket. Pair it with an S3 Lifecycle policy "+
 				"to expire old versions and control storage costs.",
-			"2.1.3",
+			"",
 		), nil
 	}
 
@@ -260,6 +267,109 @@ func (s *S3Scanner) newFinding(
 		Status:    models.StatusOpen,
 		Timestamp: time.Now().UTC(),
 	}
+}
+
+// =============================================================================
+// New checks — CIS 2.1.2, 2.1.4, public ACL
+// =============================================================================
+
+// checkHTTPSPolicy detects S3 buckets that do not enforce HTTPS-only access
+// via a bucket policy with a Deny on aws:SecureTransport = false.
+//
+// Why it matters (CIS 2.1.2):
+// Without an HTTPS-enforcement policy, clients can send requests to the bucket
+// over unencrypted HTTP. Data in transit — including object contents, object
+// keys, and any pre-signed URL payloads — is visible to a network attacker.
+// A bucket policy that explicitly denies non-HTTPS requests prevents this at
+// the API level, regardless of what the client chooses to do.
+func (s *S3Scanner) checkHTTPSPolicy(ctx context.Context, bucket string) (*models.Finding, error) {
+	out, err := s.client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		// NoSuchBucketPolicy means there is no policy at all — no HTTPS enforcement possible.
+		return s.newFinding(bucket,
+			models.SeverityHigh,
+			"S3 bucket does not enforce HTTPS-only access",
+			"The bucket has no bucket policy, so clients can access it over unencrypted HTTP. "+
+				"Data in transit — object contents, keys, and metadata — is exposed to "+
+				"network interception.",
+			"Add a bucket policy that denies all requests where aws:SecureTransport is false. "+
+				"Example condition: {\"Bool\": {\"aws:SecureTransport\": \"false\"}}. "+
+				"Apply the Deny to both the bucket ARN and the /* resource.",
+			"2.1.2",
+		), nil
+	}
+
+	// If a policy exists, check whether it references aws:SecureTransport.
+	// This is a conservative heuristic: if the policy contains this condition
+	// key at all, assume it is correctly enforcing HTTPS.
+	if !strings.Contains(aws.ToString(out.Policy), "aws:SecureTransport") {
+		return s.newFinding(bucket,
+			models.SeverityHigh,
+			"S3 bucket policy does not enforce HTTPS-only access",
+			"A bucket policy exists but does not contain an aws:SecureTransport condition. "+
+				"Without this condition, clients can still access the bucket over HTTP even "+
+				"though a policy is present.",
+			"Update the bucket policy to include a Deny statement with condition "+
+				"{\"Bool\": {\"aws:SecureTransport\": \"false\"}} applied to s3:* on both "+
+				"the bucket and its objects.",
+			"2.1.2",
+		), nil
+	}
+
+	return nil, nil
+}
+
+// checkPublicACL detects S3 buckets whose ACL grants read or full-control
+// access to the AllUsers group (the entire internet).
+//
+// Why it matters:
+// S3 ACLs are a legacy access control mechanism. An ACL that grants READ or
+// FULL_CONTROL to the AllUsers group (URI: .../AllUsers) makes every object in
+// the bucket readable or writable by anyone on the internet without
+// authentication. This is one of the most common causes of S3 data breaches.
+// Note: Block Public Access settings should prevent this when fully enabled,
+// but this check catches cases where Block Public Access is misconfigured.
+func (s *S3Scanner) checkPublicACL(ctx context.Context, bucket string) (*models.Finding, error) {
+	out, err := s.client.GetBucketAcl(ctx, &s3.GetBucketAclInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getting ACL for %s: %w", bucket, err)
+	}
+
+	const allUsersURI = "http://acs.amazonaws.com/groups/global/AllUsers"
+
+	for _, grant := range out.Grants {
+		if grant.Grantee == nil {
+			continue
+		}
+		if grant.Grantee.Type != types.TypeGroup {
+			continue
+		}
+		if aws.ToString(grant.Grantee.URI) != allUsersURI {
+			continue
+		}
+		// AllUsers has READ or FULL_CONTROL — this bucket is publicly accessible.
+		perm := string(grant.Permission)
+		return s.newFinding(bucket,
+			models.SeverityCritical,
+			"S3 bucket ACL grants public read access to the internet",
+			fmt.Sprintf(
+				"The bucket '%s' has an ACL entry that grants %s permission to the "+
+					"AllUsers group (the entire internet). Any unauthenticated user can "+
+					"access objects in this bucket. This is a leading cause of S3 data breaches.",
+				bucket, perm),
+			"Remove the public ACL grant from the bucket immediately. Enable all four "+
+				"S3 Block Public Access settings to prevent any future ACL or policy from "+
+				"re-exposing the bucket. Audit what data was in the bucket and treat the "+
+				"exposure as a potential data breach.",
+			"",
+		), nil
+	}
+
+	return nil, nil
 }
 
 // generateID returns a random hex string suitable for use as a finding ID.

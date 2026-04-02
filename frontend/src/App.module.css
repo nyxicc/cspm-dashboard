@@ -50,6 +50,79 @@
   margin-top: 2px;
 }
 
+/* ── Tab bar ────────────────────────────────────────────────── */
+.tabBar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 var(--space-8);
+  background-color: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  appearance: none;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: -1px; /* overlap the border-bottom of tabBar */
+  transition: color 0.15s ease, border-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.tab:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.tabActive {
+  color: var(--text-primary);
+  border-bottom-color: var(--border-focus);
+  font-weight: 600;
+}
+
+.tabCount {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  padding: 0 5px;
+  height: 18px;
+  background: rgba(88, 166, 255, 0.12);
+  border: 1px solid rgba(88, 166, 255, 0.2);
+  border-radius: 9px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--border-focus);
+}
+
+.tabBeta {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 5px;
+  height: 16px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: var(--radius-sm);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--sev-critical);
+  letter-spacing: 0.06em;
+}
+
 /* ── Main ───────────────────────────────────────────────────── */
 .main {
   flex: 1;

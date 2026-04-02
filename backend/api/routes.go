@@ -3,11 +3,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,6 +41,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/scan", s.handleScan)
 	mux.HandleFunc("/api/findings/summary", s.handleSummary)
+	mux.HandleFunc("/api/explain", s.handleExplain)
+	mux.HandleFunc("/api/attack-paths", s.handleAttackPaths)
 
 	var h http.Handler = mux
 	h = corsMiddleware(h)
@@ -194,6 +199,114 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleExplain accepts a single Finding in the POST body, calls the Claude
+// API to generate a plain-English risk explanation, and returns it as JSON.
+// The Anthropic API key is read from the ANTHROPIC_API_KEY environment variable
+// and is never forwarded to or exposed by the frontend.
+func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var finding models.Finding
+	if err := json.NewDecoder(r.Body).Decode(&finding); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		writeError(w, http.StatusInternalServerError, "ANTHROPIC_API_KEY is not configured on the server")
+		return
+	}
+
+	explanation, err := callClaude(r.Context(), apiKey, &finding)
+	if err != nil {
+		log.Printf("[explain] Claude API error: %v", err)
+		writeError(w, http.StatusBadGateway, "AI service error: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"explanation": explanation})
+}
+
+// claudeSystemPrompt is the persona and instruction set sent to Claude for
+// every explain request.
+const claudeSystemPrompt = `You are a cloud security expert explaining AWS misconfigurations to a security team. Always respond using exactly these four labeled sections and no other text:
+
+**What it is:** [One sentence explaining the specific misconfiguration on this resource]
+**Why it's dangerous:** [One sentence on the concrete security risk this creates]
+**Attack scenario:** [One to two sentences describing exactly what an attacker would do with this exposure, using the actual resource name]
+**Immediate fix:** [One to two sentences of specific, actionable remediation steps]
+
+Be technical and direct. Use the actual resource names and service names from the finding.`
+
+// callClaude sends the finding details to the Claude API and returns the
+// generated explanation text.
+func callClaude(ctx context.Context, apiKey string, f *models.Finding) (string, error) {
+	userMsg := fmt.Sprintf(
+		"Title: %s\nService: %s\nSeverity: %s\nAffected Resource: %s (%s)\nRegion: %s\nCIS Control: %s\nDescription: %s\nRecommendation: %s",
+		f.Title, f.Service, f.Severity,
+		f.ResourceName, f.ResourceType,
+		f.Region, f.CISControl,
+		f.Description, f.Recommendation,
+	)
+
+	reqBody := map[string]any{
+		"model":      "claude-sonnet-4-20250514",
+		"max_tokens": 1024,
+		"system":     claudeSystemPrompt,
+		"messages": []map[string]string{
+			{"role": "user", "content": userMsg},
+		},
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshalling request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.anthropic.com/v1/messages", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("calling Claude API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Claude API returned %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var result struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		return "", fmt.Errorf("parsing Claude response: %w", err)
+	}
+	for _, block := range result.Content {
+		if block.Type == "text" {
+			return block.Text, nil
+		}
+	}
+	return "", fmt.Errorf("no text block in Claude response")
+}
+
 // =============================================================================
 // Scanner factory
 // =============================================================================
@@ -234,6 +347,12 @@ func buildScanners(ctx context.Context, req ScanRequest) ([]scanners.Scanner, er
 		scanners.NewIAMScanner(cfg, accountID),
 		scanners.NewEC2Scanner(cfg, accountID),
 		scanners.NewCloudTrailScanner(cfg, accountID),
+		scanners.NewRDSScanner(cfg, accountID),
+		scanners.NewGuardDutyScanner(cfg, accountID),
+		scanners.NewConfigScanner(cfg, accountID),
+		scanners.NewSecurityHubScanner(cfg, accountID),
+		scanners.NewLambdaScanner(cfg, accountID),
+		scanners.NewKMSScanner(cfg, accountID),
 	}, nil
 }
 

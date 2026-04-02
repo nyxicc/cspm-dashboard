@@ -1,0 +1,35 @@
+.scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* Give the SVG room to breathe on narrow viewports */
+  padding-bottom: var(--space-2);
+}
+
+.svg {
+  display: block;
+}
+
+/* Animated dashes flow left → right along connecting lines */
+.flowLine {
+  animation: flowDash 1.4s linear infinite;
+}
+
+@keyframes flowDash {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -27; } /* -(6+3)*3 — one full cycle of 3 dashes */
+}
+
+/* Node group — pointer cursor, hover brightens the fill slightly */
+.node {
+  cursor: pointer;
+}
+
+.node:hover rect:first-child {
+  filter: brightness(1.3);
+}
+
+/* Hover ring becomes visible on hover */
+.node:hover .hoverRing {
+  stroke-width: 2.5;
+  filter: drop-shadow(0 0 6px currentColor);
+}

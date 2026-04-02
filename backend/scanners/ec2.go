@@ -53,6 +53,11 @@ func (s *EC2Scanner) Scan(ctx context.Context) ([]models.Finding, error) {
 	}
 	findings = append(findings, ebsFindings...)
 
+	// CIS 3.9 — VPC flow logs must be enabled on every VPC.
+	if vpcFindings, err := s.checkVPCFlowLogs(ctx); err == nil {
+		findings = append(findings, vpcFindings...)
+	}
+
 	return findings, nil
 }
 
@@ -81,6 +86,25 @@ func (s *EC2Scanner) checkSecurityGroups(ctx context.Context) ([]models.Finding,
 			}
 			if f := s.checkDefaultSGTraffic(sg); f != nil {
 				findings = append(findings, *f)
+			}
+
+			// Additional database and web port checks.
+			for _, pc := range []struct {
+				port int32
+				name string
+				cis  string
+				sev  models.Severity
+			}{
+				{3306, "MySQL", "5.2", models.SeverityCritical},
+				{5432, "PostgreSQL", "5.2", models.SeverityCritical},
+				{27017, "MongoDB", "5.2", models.SeverityCritical},
+				{1433, "MSSQL", "5.2", models.SeverityCritical},
+				{80, "HTTP", "5.2", models.SeverityLow},
+				{443, "HTTPS", "5.2", models.SeverityLow},
+			} {
+				if f := s.checkUnrestrictedPortSev(sg, pc.port, pc.name, pc.cis, pc.sev); f != nil {
+					findings = append(findings, *f)
+				}
 			}
 		}
 	}
@@ -342,4 +366,115 @@ func nameFromTags(tags []types.Tag, fallback string) string {
 		}
 	}
 	return fallback
+}
+
+// =============================================================================
+// New checks — CIS 5.1, additional ports (5.2)
+// =============================================================================
+
+// checkUnrestrictedPortSev is identical to checkUnrestrictedPort but accepts
+// a severity parameter, allowing database and web ports to carry different
+// severity levels than SSH/RDP while reusing the same detection logic.
+func (s *EC2Scanner) checkUnrestrictedPortSev(sg types.SecurityGroup, port int32, portName, cisControl string, severity models.Severity) *models.Finding {
+	for _, perm := range sg.IpPermissions {
+		if !coversPort(perm, port) {
+			continue
+		}
+		if !isUnrestricted(perm) {
+			continue
+		}
+
+		sgID := aws.ToString(sg.GroupId)
+		sgName := aws.ToString(sg.GroupName)
+		vpcID := aws.ToString(sg.VpcId)
+
+		return s.newFinding(
+			fmt.Sprintf("arn:aws:ec2:%s:%s:security-group/%s", s.region, s.accountID, sgID),
+			"AWS::EC2::SecurityGroup",
+			sgName,
+			severity,
+			fmt.Sprintf("Security group allows unrestricted inbound %s access (port %d)", portName, port),
+			fmt.Sprintf(
+				"Security group '%s' (%s) in VPC %s has an inbound rule that allows "+
+					"port %d (%s) from 0.0.0.0/0 or ::/0. Any host on the internet can "+
+					"attempt to connect to instances using this security group.",
+				sgName, sgID, vpcID, port, portName),
+			fmt.Sprintf(
+				"Remove the wildcard inbound rule for port %d from security group '%s'. "+
+					"Replace it with rules that allow access only from known, trusted CIDR "+
+					"ranges. For database ports, access should never be permitted from the "+
+					"public internet — place DB instances in private subnets instead.",
+				port, sgName),
+			cisControl,
+		)
+	}
+	return nil
+}
+
+// checkVPCFlowLogs detects VPCs in the region that do not have VPC flow logs
+// enabled.
+//
+// Why it matters (CIS 3.9):
+// Flow logs record metadata about every IP packet that enters or leaves a
+// network interface in the VPC: source/destination IP, port, protocol, bytes
+// transferred, and whether the packet was accepted or rejected. Without them,
+// there is no network-level visibility — you cannot detect port scans,
+// lateral movement, data exfiltration over unusual ports, or verify that
+// security groups are behaving as intended. Flow logs are the network
+// equivalent of CloudTrail for the API plane.
+func (s *EC2Scanner) checkVPCFlowLogs(ctx context.Context) ([]models.Finding, error) {
+	var findings []models.Finding
+
+	vpcsOut, err := s.client.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, vpc := range vpcsOut.Vpcs {
+		vpcID := aws.ToString(vpc.VpcId)
+
+		flowOut, err := s.client.DescribeFlowLogs(ctx, &ec2.DescribeFlowLogsInput{
+			Filter: []types.Filter{
+				{Name: aws.String("resource-id"), Values: []string{vpcID}},
+			},
+		})
+		if err != nil {
+			// Skip VPCs where we cannot check flow logs (e.g., permission denied).
+			continue
+		}
+
+		hasActive := false
+		for _, fl := range flowOut.FlowLogs {
+			if aws.ToString(fl.FlowLogStatus) == "ACTIVE" {
+				hasActive = true
+				break
+			}
+		}
+
+		if !hasActive {
+			vpcName := nameFromTags(vpc.Tags, vpcID)
+			findings = append(findings, *s.newFinding(
+				fmt.Sprintf("arn:aws:ec2:%s:%s:vpc/%s", s.region, s.accountID, vpcID),
+				"AWS::EC2::VPC",
+				vpcName,
+				models.SeverityHigh,
+				"VPC does not have flow logs enabled",
+				fmt.Sprintf(
+					"VPC '%s' (%s) in region %s has no active flow logs. Without flow logs, "+
+						"there is no record of network traffic — making it impossible to "+
+						"investigate intrusions, detect data exfiltration, or verify that "+
+						"security group rules are working as intended.",
+					vpcName, vpcID, s.region),
+				fmt.Sprintf(
+					"Enable VPC flow logs for VPC '%s'. Deliver logs to CloudWatch Logs "+
+						"for real-time alerting or to an S3 bucket for cost-effective storage. "+
+						"Configure the log format to include all available fields including "+
+						"vpc-id, subnet-id, instance-id, and tcp-flags.",
+					vpcID),
+				"3.9",
+			))
+		}
+	}
+
+	return findings, nil
 }

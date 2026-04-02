@@ -1,0 +1,11 @@
+.env
+*.env
+.env.local
+
+# Go build output
+backend/cspm-dashboard.exe
+backend/*.exe
+
+# Node
+frontend/node_modules/
+frontend/dist/

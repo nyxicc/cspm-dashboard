@@ -4,6 +4,7 @@ import { useScan }         from './hooks/useScan';
 import SeveritySummaryBar from './components/SeveritySummaryBar/SeveritySummaryBar';
 import ComplianceCards    from './components/ComplianceCards/ComplianceCards';
 import FindingsTable      from './components/FindingsTable/FindingsTable';
+import AttackPaths        from './components/AttackPaths/AttackPaths';
 import styles from './App.module.css';
 
 const REGIONS = [
@@ -24,17 +25,14 @@ export default function App() {
   const summary = useSummary();
   const scan    = useScan();
 
-  // Whether the user has submitted credentials and we've moved to the dashboard.
-  const [scanned, setScanned] = useState(false);
-  // Stored credentials so "Re-scan" doesn't require re-entry.
+  const [scanned,    setScanned]    = useState(false);
   const [savedCreds, setSavedCreds] = useState(null);
-  // Controlled form state on the landing page.
-  const [form, setForm] = useState(EMPTY_FORM);
+  const [form,       setForm]       = useState(EMPTY_FORM);
+  const [activeTab,  setActiveTab]  = useState('findings');
 
   const findings   = scan.data?.findings ?? [];
   const isScanning = scan.loading || summary.loading;
 
-  // Build the creds object the backend expects.
   const toCreds = (f) => ({
     access_key_id:     f.accessKeyId,
     secret_access_key: f.secretAccessKey,
@@ -52,12 +50,14 @@ export default function App() {
     const creds = toCreds(form);
     setSavedCreds(creds);
     setScanned(true);
+    setActiveTab('findings');
     summary.run(creds);
     scan.run(creds);
   }, [form, summary, scan]);
 
   const handleRescan = useCallback(() => {
     if (!savedCreds) return;
+    setActiveTab('findings');
     summary.run(savedCreds);
     scan.run(savedCreds);
   }, [savedCreds, summary, scan]);
@@ -72,7 +72,6 @@ export default function App() {
       <div className={styles.layout}>
         <div className={styles.landing}>
           <div className={styles.landingCard}>
-            <span className={styles.landingIcon}>🛡</span>
             <h1 className={styles.landingTitle}>CSPM Dashboard</h1>
             <p className={styles.landingDesc}>
               Enter your AWS credentials to scan your account against CIS
@@ -80,7 +79,6 @@ export default function App() {
             </p>
 
             <form className={styles.credForm} onSubmit={handleScanSubmit}>
-              {/* Access Key ID + Secret — side by side on wide screens */}
               <div className={styles.formRow}>
                 <div className={styles.formGroup}>
                   <label className={styles.formLabel} htmlFor="accessKeyId">
@@ -99,7 +97,6 @@ export default function App() {
                     required
                   />
                 </div>
-
                 <div className={styles.formGroup}>
                   <label className={styles.formLabel} htmlFor="secretAccessKey">
                     Secret Access Key
@@ -118,11 +115,8 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Region */}
               <div className={styles.formGroup}>
-                <label className={styles.formLabel} htmlFor="region">
-                  Region
-                </label>
+                <label className={styles.formLabel} htmlFor="region">Region</label>
                 <select
                   id="region"
                   name="region"
@@ -130,13 +124,10 @@ export default function App() {
                   value={form.region}
                   onChange={handleFormChange}
                 >
-                  {REGIONS.map(r => (
-                    <option key={r} value={r}>{r}</option>
-                  ))}
+                  {REGIONS.map(r => <option key={r} value={r}>{r}</option>)}
                 </select>
               </div>
 
-              {/* Session Token — optional */}
               <div className={styles.formGroup}>
                 <label className={styles.formLabel} htmlFor="sessionToken">
                   Session Token{' '}
@@ -154,11 +145,7 @@ export default function App() {
                 />
               </div>
 
-              <button
-                type="submit"
-                className={styles.scanBtn}
-                disabled={!canSubmit}
-              >
+              <button type="submit" className={styles.scanBtn} disabled={!canSubmit}>
                 Run Security Scan
               </button>
             </form>
@@ -177,7 +164,6 @@ export default function App() {
     <div className={styles.layout}>
       <header className={styles.header}>
         <div className={styles.brand}>
-          <span className={styles.brandIcon}>🛡</span>
           <div>
             <h1 className={styles.brandName}>CSPM Dashboard</h1>
             <p className={styles.brandSub}>Cloud Security Posture Management</p>
@@ -211,32 +197,59 @@ export default function App() {
         </div>
       </header>
 
-      <main className={styles.main}>
-        <section className={styles.section}>
-          <h2 className={styles.sectionTitle}>Compliance by Service</h2>
-          <p className={styles.sectionSub}>
-            Security posture across each scanned AWS service
-          </p>
-          <ComplianceCards
-            findings={findings}
-            loading={scan.loading}
-            error={scan.error}
-          />
-        </section>
+      {/* ── Tab bar ─────────────────────────────────────────────── */}
+      <nav className={styles.tabBar}>
+        <button
+          className={`${styles.tab} ${activeTab === 'findings' ? styles.tabActive : ''}`}
+          onClick={() => setActiveTab('findings')}
+        >
+          Findings
+          {!scan.loading && findings.length > 0 && (
+            <span className={styles.tabCount}>{findings.length}</span>
+          )}
+        </button>
+        <button
+          className={`${styles.tab} ${activeTab === 'attack-paths' ? styles.tabActive : ''}`}
+          onClick={() => setActiveTab('attack-paths')}
+          disabled={scan.loading || findings.length === 0}
+          title={scan.loading ? 'Waiting for scan to complete…' : ''}
+        >
+          Attack Paths
+          <span className={styles.tabBeta}>AI</span>
+        </button>
+      </nav>
 
-        <section className={styles.section}>
-          <h2 className={styles.sectionTitle}>All Findings</h2>
-          <p className={styles.sectionSub}>
-            {scan.loading
-              ? 'Running live AWS scan — this may take up to a minute…'
-              : `${findings.length} total findings across your AWS account`}
-          </p>
-          <FindingsTable
-            findings={findings}
-            loading={scan.loading}
-            error={scan.error}
-          />
-        </section>
+      <main className={styles.main}>
+        {activeTab === 'findings' && (
+          <>
+            <section className={styles.section}>
+              <h2 className={styles.sectionTitle}>Compliance by Service</h2>
+              <p className={styles.sectionSub}>Security posture across each scanned AWS service</p>
+              <ComplianceCards findings={findings} loading={scan.loading} error={scan.error} />
+            </section>
+
+            <section className={styles.section}>
+              <h2 className={styles.sectionTitle}>All Findings</h2>
+              <p className={styles.sectionSub}>
+                {scan.loading
+                  ? 'Running live AWS scan — this may take up to a minute…'
+                  : `${findings.length} total findings across your AWS account`}
+              </p>
+              <FindingsTable findings={findings} loading={scan.loading} error={scan.error} />
+            </section>
+          </>
+        )}
+
+        {activeTab === 'attack-paths' && (
+          <section className={styles.section}>
+            <h2 className={styles.sectionTitle}>Attack Path Analysis</h2>
+            <p className={styles.sectionSub}>
+              AI-identified chains of misconfigurations an attacker could exploit in sequence
+            </p>
+            {/* Unmount/remount on each tab visit so analysis always re-runs */}
+            <AttackPaths key={scan.data?.scanned_at} findings={findings} />
+          </section>
+        )}
       </main>
     </div>
   );

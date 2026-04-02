@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -55,12 +56,22 @@ func (s *IAMScanner) ServiceName() string { return "IAM" }
 func (s *IAMScanner) Scan(ctx context.Context) ([]models.Finding, error) {
 	var findings []models.Finding
 
-	// Account-level check — runs once, not per-user.
+	// Account-level checks — run once, not per-user.
 	rootFindings, err := s.checkRootAccessKeys(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("iam: checking root access keys: %w", err)
 	}
 	findings = append(findings, rootFindings...)
+
+	// CIS 1.5 — root MFA.
+	if fs, err := s.checkRootMFA(ctx); err == nil {
+		findings = append(findings, fs...)
+	}
+
+	// Account-level: password policy checks (CIS 1.8, 1.9).
+	if fs, err := s.checkPasswordPolicy(ctx); err == nil {
+		findings = append(findings, fs...)
+	}
 
 	// Paginate through every IAM user once, then run all per-user checks.
 	users, err := s.listAllUsers(ctx)
@@ -82,6 +93,18 @@ func (s *IAMScanner) Scan(ctx context.Context) ([]models.Finding, error) {
 			findings = append(findings, fs...)
 		}
 		if fs, err := s.checkAccessKeyAge(ctx, username, userARN); err == nil {
+			findings = append(findings, fs...)
+		}
+		if fs, err := s.checkInactiveUser(ctx, user); err == nil {
+			findings = append(findings, fs...)
+		}
+		if fs, err := s.checkUserConsoleAndKeys(ctx, username, userARN); err == nil {
+			findings = append(findings, fs...)
+		}
+		if fs, err := s.checkSingleActiveAccessKey(ctx, username, userARN); err == nil {
+			findings = append(findings, fs...)
+		}
+		if fs, err := s.checkPermissionsOnlyThroughGroups(ctx, username, userARN); err == nil {
 			findings = append(findings, fs...)
 		}
 	}
@@ -482,4 +505,383 @@ func containsWildcard(values []string) bool {
 		}
 	}
 	return false
+}
+
+// =============================================================================
+// New checks — CIS 1.5, 1.8, 1.9, 1.11, 1.12, 1.13, 1.15
+// =============================================================================
+
+// checkPasswordPolicy fetches the account-level IAM password policy and emits
+// a finding for each CIS requirement that is not met.
+//
+// CIS 1.8 covers minimum length and complexity; CIS 1.9 covers reuse
+// prevention and expiration. If no policy exists at all, a single
+// comprehensive finding is returned and the individual sub-checks are skipped.
+func (s *IAMScanner) checkPasswordPolicy(ctx context.Context) ([]models.Finding, error) {
+	var findings []models.Finding
+	arn := fmt.Sprintf("arn:aws:iam::%s:account", s.accountID)
+
+	out, err := s.client.GetAccountPasswordPolicy(ctx, &iam.GetAccountPasswordPolicyInput{})
+	if err != nil {
+		var noSuchEntity *types.NoSuchEntityException
+		if errors.As(err, &noSuchEntity) {
+			// No policy at all — one finding covers all four sub-checks.
+			findings = append(findings, s.newFinding(
+				arn, "AWS::IAM::PasswordPolicy", "account-password-policy",
+				models.SeverityHigh,
+				"No IAM account password policy is configured",
+				"No IAM password policy is set for this account. Without one, IAM users "+
+					"can set passwords of any length and complexity, passwords never expire, "+
+					"and previously used passwords can be reused immediately. This violates "+
+					"CIS controls 1.8 and 1.9.",
+				"Create an IAM account password policy that enforces: minimum length 14+, "+
+					"uppercase, lowercase, numbers, and symbols required, password reuse "+
+					"prevention of 24+, and a maximum password age of 90 days.",
+				"1.8",
+			))
+			return findings, nil
+		}
+		return nil, err
+	}
+
+	p := out.PasswordPolicy
+
+	// CIS 1.8 — minimum password length >= 14.
+	if aws.ToInt32(p.MinimumPasswordLength) < 14 {
+		findings = append(findings, s.newFinding(
+			arn, "AWS::IAM::PasswordPolicy", "account-password-policy",
+			models.SeverityMedium,
+			"IAM password policy minimum length is less than 14 characters",
+			fmt.Sprintf(
+				"The account password policy requires a minimum of %d characters. "+
+					"CIS recommends at least 14 to reduce susceptibility to brute-force attacks.",
+				aws.ToInt32(p.MinimumPasswordLength)),
+			"Update the IAM account password policy to require a minimum length of 14 characters.",
+			"1.8",
+		))
+	}
+
+	// CIS 1.8 — all four complexity requirements must be enabled.
+	var missing []string
+	if !p.RequireUppercaseCharacters {
+		missing = append(missing, "uppercase letters")
+	}
+	if !p.RequireLowercaseCharacters {
+		missing = append(missing, "lowercase letters")
+	}
+	if !p.RequireNumbers {
+		missing = append(missing, "numbers")
+	}
+	if !p.RequireSymbols {
+		missing = append(missing, "symbols")
+	}
+	if len(missing) > 0 {
+		findings = append(findings, s.newFinding(
+			arn, "AWS::IAM::PasswordPolicy", "account-password-policy",
+			models.SeverityMedium,
+			"IAM password policy does not enforce all complexity requirements",
+			fmt.Sprintf(
+				"The password policy is missing complexity requirements for: %s. "+
+					"Complex passwords significantly reduce susceptibility to dictionary attacks.",
+				strings.Join(missing, ", ")),
+			"Update the IAM account password policy to require uppercase, lowercase, numbers, and symbols.",
+			"1.8",
+		))
+	}
+
+	// CIS 1.9 — password reuse prevention >= 24.
+	if aws.ToInt32(p.PasswordReusePrevention) < 24 {
+		findings = append(findings, s.newFinding(
+			arn, "AWS::IAM::PasswordPolicy", "account-password-policy",
+			models.SeverityMedium,
+			"IAM password policy does not prevent sufficient password reuse",
+			fmt.Sprintf(
+				"The policy only prevents reuse of the last %d passwords. "+
+					"CIS requires at least 24 to prevent users from cycling through a small set.",
+				aws.ToInt32(p.PasswordReusePrevention)),
+			"Update the IAM account password policy to prevent reuse of the last 24 passwords.",
+			"1.9",
+		))
+	}
+
+	// CIS 1.9 — passwords must expire.
+	if !p.ExpirePasswords {
+		findings = append(findings, s.newFinding(
+			arn, "AWS::IAM::PasswordPolicy", "account-password-policy",
+			models.SeverityMedium,
+			"IAM password policy does not require password expiration",
+			"The account password policy does not require users to change their passwords "+
+				"periodically. Without expiration, a stolen password remains valid indefinitely.",
+			"Update the IAM account password policy to set a maximum password age of 90 days or less.",
+			"1.9",
+		))
+	}
+
+	return findings, nil
+}
+
+// checkRootMFA detects whether multi-factor authentication is enabled on the
+// AWS root account.
+//
+// Why it matters (CIS 1.5):
+// The root account has unrestricted access to every AWS service and resource —
+// it cannot be limited by IAM policies, SCPs, or permission boundaries. A stolen
+// root password without MFA gives an attacker total, permanent control over the
+// account. Root MFA is one of the single highest-value security controls.
+func (s *IAMScanner) checkRootMFA(ctx context.Context) ([]models.Finding, error) {
+	out, err := s.client.GetAccountSummary(ctx, &iam.GetAccountSummaryInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	if out.SummaryMap[string(types.SummaryKeyTypeAccountMFAEnabled)] == 0 {
+		rootARN := fmt.Sprintf("arn:aws:iam::%s:root", s.accountID)
+		return []models.Finding{s.newFinding(
+			rootARN, "AWS::IAM::Root", "root",
+			models.SeverityCritical,
+			"Root account does not have MFA enabled",
+			"The AWS root account has no MFA device enrolled. The root account bypasses "+
+				"all IAM permission boundaries and cannot be constrained by any policy. "+
+				"A stolen root password without MFA grants total, unrestricted control "+
+				"over the entire account and all its resources.",
+			"Enable hardware MFA on the root account immediately via the AWS console "+
+				"under My Security Credentials. A hardware TOTP token is preferred over "+
+				"virtual MFA because it cannot be phished. The root account should only "+
+				"be used for the handful of tasks that genuinely require it.",
+			"1.5",
+		)}, nil
+	}
+	return nil, nil
+}
+
+// checkSingleActiveAccessKey detects IAM users with more than one active access key.
+//
+// Why it matters (CIS 1.13):
+// AWS allows each IAM user to have up to two access keys. Having two active keys
+// simultaneously doubles the attack surface: a leaked key is harder to identify
+// and rotate, key age policies become ambiguous, and CloudTrail attribution is
+// more complex. Maintaining only one active key enforces a clean rotation discipline.
+func (s *IAMScanner) checkSingleActiveAccessKey(ctx context.Context, username, userARN string) ([]models.Finding, error) {
+	keysOut, err := s.client.ListAccessKeys(ctx, &iam.ListAccessKeysInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing access keys for %s: %w", username, err)
+	}
+
+	activeCount := 0
+	for _, key := range keysOut.AccessKeyMetadata {
+		if key.Status == types.StatusTypeActive {
+			activeCount++
+		}
+	}
+
+	if activeCount > 1 {
+		return []models.Finding{s.newFinding(
+			userARN, "AWS::IAM::User", username,
+			models.SeverityMedium,
+			"IAM user has more than one active access key",
+			fmt.Sprintf(
+				"User '%s' has %d active access keys. CIS 1.13 requires that each user "+
+					"have at most one active key. Multiple active keys increase the chance "+
+					"that a leaked key goes undetected and complicate rotation procedures.",
+				username, activeCount),
+			fmt.Sprintf(
+				"Check which access key for user '%s' is in active use by reviewing "+
+					"LastUsedDate in the IAM console. Deactivate the older or unused key, "+
+					"confirm no breakage, then delete it. Limit each user to one active key at all times.",
+				username),
+			"1.13",
+		)}, nil
+	}
+
+	return nil, nil
+}
+
+// checkPermissionsOnlyThroughGroups detects IAM users who have managed policies
+// attached directly to them rather than through IAM groups.
+//
+// Why it matters (CIS 1.15):
+// Direct policy attachments make permissions harder to audit, revoke at scale,
+// and govern consistently. When permissions are managed through groups, access
+// reviews are simple: remove the user from the group. Direct attachments must
+// be hunted individually across every user in the account.
+func (s *IAMScanner) checkPermissionsOnlyThroughGroups(ctx context.Context, username, userARN string) ([]models.Finding, error) {
+	attachedOut, err := s.client.ListAttachedUserPolicies(ctx, &iam.ListAttachedUserPoliciesInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing attached policies for %s: %w", username, err)
+	}
+
+	if len(attachedOut.AttachedPolicies) == 0 {
+		return nil, nil
+	}
+
+	names := make([]string, 0, len(attachedOut.AttachedPolicies))
+	for _, p := range attachedOut.AttachedPolicies {
+		names = append(names, aws.ToString(p.PolicyName))
+	}
+
+	plural := "y"
+	if len(names) != 1 {
+		plural = "ies"
+	}
+
+	return []models.Finding{s.newFinding(
+		userARN, "AWS::IAM::User", username,
+		models.SeverityMedium,
+		"IAM user has managed policies attached directly instead of through a group",
+		fmt.Sprintf(
+			"User '%s' has %d managed polic%s attached directly: %s. "+
+				"CIS 1.15 requires all permissions to flow through IAM groups so that "+
+				"access can be managed, audited, and revoked centrally.",
+			username, len(names), plural, strings.Join(names, ", ")),
+		fmt.Sprintf(
+			"Remove the directly attached policies from user '%s'. Create or identify "+
+				"an IAM group with the equivalent permissions and add the user to that group. "+
+				"If multiple users share the same role, this approach also eliminates "+
+				"per-user permission drift.",
+			username),
+		"1.15",
+	)}, nil
+}
+
+// checkInactiveUser detects IAM users whose console credentials have not been
+// used for 90 days or more (or have never been used on an account older than 90 days).
+//
+// Why it matters (CIS 1.12):
+// Stale credentials are a persistent risk — the user may have left the organisation
+// but their password remains valid. CIS requires that credentials unused for 90+
+// days be disabled to prevent silent exploitation of dormant accounts.
+func (s *IAMScanner) checkInactiveUser(ctx context.Context, user types.User) ([]models.Finding, error) {
+	username := aws.ToString(user.UserName)
+	userARN := aws.ToString(user.Arn)
+
+	// Only check users who have console access — programmatic-only users
+	// do not log into the console so inactivity here is not meaningful.
+	_, err := s.client.GetLoginProfile(ctx, &iam.GetLoginProfileInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		var noSuchEntity *types.NoSuchEntityException
+		if errors.As(err, &noSuchEntity) {
+			return nil, nil // no console password, skip
+		}
+		return nil, fmt.Errorf("getting login profile for %s: %w", username, err)
+	}
+
+	const threshold = 90 * 24 * time.Hour
+	createDate := aws.ToTime(user.CreateDate)
+
+	// If the account itself is newer than 90 days, do not flag — the user
+	// simply has not had enough time to establish an activity pattern.
+	if time.Since(createDate) <= threshold {
+		return nil, nil
+	}
+
+	lastUsed := aws.ToTime(user.PasswordLastUsed)
+
+	if lastUsed.IsZero() {
+		// PasswordLastUsed is nil — user has never logged in despite account being 90+ days old.
+		return []models.Finding{s.newFinding(
+			userARN, "AWS::IAM::User", username,
+			models.SeverityHigh,
+			"IAM user credentials unused for 90+ days (never logged in)",
+			fmt.Sprintf(
+				"User '%s' has had a console password for over 90 days but has never logged in. "+
+					"CIS 1.12 requires that credentials unused for 90 days or more be disabled. "+
+					"Unused accounts with persistent credentials expand the attack surface.",
+				username),
+			fmt.Sprintf(
+				"Disable or delete user '%s' if they no longer need access. If the account "+
+					"is legitimately needed, remove the console password and require role "+
+					"assumption with MFA instead.",
+				username),
+			"1.12",
+		)}, nil
+	}
+
+	if time.Since(lastUsed) > threshold {
+		daysSince := int(time.Since(lastUsed).Hours() / 24)
+		return []models.Finding{s.newFinding(
+			userARN, "AWS::IAM::User", username,
+			models.SeverityHigh,
+			fmt.Sprintf("IAM user credentials unused for %d days", daysSince),
+			fmt.Sprintf(
+				"User '%s' last logged into the console %d days ago. CIS 1.12 requires "+
+					"that credentials unused for 90+ days be disabled. Stale accounts are a "+
+					"common attacker foothold because dormant logins are less likely to "+
+					"trigger anomaly detection or be noticed during incident response.",
+				username, daysSince),
+			fmt.Sprintf(
+				"Disable the console password for user '%s' or delete the account if they "+
+					"no longer need access. If access is still required, verify MFA enrollment "+
+					"and consider AWS IAM Identity Center with time-bounded access.",
+				username),
+			"1.12",
+		)}, nil
+	}
+
+	return nil, nil
+}
+
+// checkUserConsoleAndKeys detects IAM users who have both a console password
+// and at least one active programmatic access key.
+//
+// Why it matters (CIS 1.11):
+// Human users should authenticate via the console or SSO. Service accounts that
+// need programmatic access should never have a console password. Combining both
+// on the same identity means a single compromised credential (either the
+// password or the access key) grants the attacker the full range of what the
+// user can do. Separation reduces blast radius.
+func (s *IAMScanner) checkUserConsoleAndKeys(ctx context.Context, username, userARN string) ([]models.Finding, error) {
+	// Step 1: does this user have a console password?
+	_, err := s.client.GetLoginProfile(ctx, &iam.GetLoginProfileInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		var noSuchEntity *types.NoSuchEntityException
+		if errors.As(err, &noSuchEntity) {
+			return nil, nil // no console password, skip
+		}
+		return nil, fmt.Errorf("getting login profile for %s: %w", username, err)
+	}
+
+	// Step 2: count active access keys.
+	keysOut, err := s.client.ListAccessKeys(ctx, &iam.ListAccessKeysInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing access keys for %s: %w", username, err)
+	}
+
+	activeKeys := 0
+	for _, k := range keysOut.AccessKeyMetadata {
+		if k.Status == types.StatusTypeActive {
+			activeKeys++
+		}
+	}
+	if activeKeys == 0 {
+		return nil, nil
+	}
+
+	return []models.Finding{s.newFinding(
+		userARN, "AWS::IAM::User", username,
+		models.SeverityMedium,
+		"IAM user has both console password and active access keys",
+		fmt.Sprintf(
+			"User '%s' has a console password and %d active access key(s). "+
+				"Combining both credential types on a single identity increases blast radius: "+
+				"compromise of either grants the attacker the user's full set of permissions. "+
+				"Human users should authenticate via console/SSO only; programmatic access "+
+				"should use dedicated service accounts or IAM roles.",
+			username, activeKeys),
+		fmt.Sprintf(
+			"For user '%s': if they are a human user, revoke the access keys and use "+
+				"IAM Identity Center or role assumption for any programmatic needs. "+
+				"If they are a service account, remove the console password.",
+			username),
+		"1.11",
+	)}, nil
 }
