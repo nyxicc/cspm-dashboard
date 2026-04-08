@@ -1,0 +1,23 @@
+# Terraform provider cache and plugins
+.terraform/
+
+# State files (may contain sensitive resource data)
+*.tfstate
+*.tfstate.backup
+
+# Generated files
+lambda_payload.zip
+
+# Variable files that may contain secrets
+*.tfvars
+*.tfvars.json
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
