@@ -7,9 +7,17 @@ if exist "%~dp0.env" (
   for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0.env") do set "%%A=%%B"
 )
 
-REM Start the Go backend in a new window (inherits env vars set above)
-set "BACKEND_DIR=%~dp0backend"
-start "CSPM Backend" cmd /k "cd /d "%BACKEND_DIR%" && go run . && pause"
+REM Build the backend binary if it doesn't exist.
+REM Running the pre-built exe avoids a 60s+ recompile on every start.
+pushd "%~dp0backend"
+if not exist "cspm-backend.exe" (
+  echo Building backend binary...
+  go build -o cspm-backend.exe .
+)
+REM Use cmd /c to pass a script file so env vars (ANTHROPIC_API_KEY etc.)
+REM are inherited by the new window — cmd /k with a quoted string drops them.
+start "CSPM Backend" cmd /k "cspm-backend.exe"
+popd
 
 REM Wait until the backend is actually listening on port 8080
 echo Waiting for backend to be ready...

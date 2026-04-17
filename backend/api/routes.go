@@ -20,6 +20,7 @@ import (
 
 	"cspm-dashboard/backend/models"
 	"cspm-dashboard/backend/scanners"
+	"cspm-dashboard/backend/scanners/azure"
 )
 
 // scanTimeout is the maximum time a full scan may run before it is cancelled.
@@ -57,11 +58,24 @@ func (s *Server) Handler() http.Handler {
 // ScanRequest is the JSON body accepted by POST /api/scan and
 // POST /api/findings/summary. Credentials are used for that request only —
 // they are never stored.
+//
+// Set provider to "aws" (or omit it) for AWS scanning, or "azure" for Azure.
+// Only the fields relevant to the chosen provider need to be supplied.
 type ScanRequest struct {
+	// Provider selects the cloud platform to scan. "aws" (default) or "azure".
+	Provider string `json:"provider"`
+
+	// AWS credentials — required when provider is "aws" (or omitted).
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
-	SessionToken    string `json:"session_token"`  // optional — for temporary/STS creds
+	SessionToken    string `json:"session_token"` // optional — for temporary/STS creds
 	Region          string `json:"region"`
+
+	// Azure Service Principal credentials — required when provider is "azure".
+	SubscriptionID string `json:"subscription_id"`
+	ClientID       string `json:"client_id"`
+	ClientSecret   string `json:"client_secret"`
+	TenantID       string `json:"tenant_id"`
 }
 
 // scanError records a scanner failure without aborting the overall response.
@@ -118,8 +132,8 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if req.AccessKeyID == "" || req.SecretAccessKey == "" || req.Region == "" {
-		writeError(w, http.StatusBadRequest, "access_key_id, secret_access_key, and region are required")
+	if err := validateScanRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -145,7 +159,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSummary accepts AWS credentials, runs a full scan, and returns
+// handleSummary accepts cloud credentials, runs a full scan, and returns
 // finding counts grouped by severity and service.
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -158,8 +172,8 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if req.AccessKeyID == "" || req.SecretAccessKey == "" || req.Region == "" {
-		writeError(w, http.StatusBadRequest, "access_key_id, secret_access_key, and region are required")
+	if err := validateScanRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -311,14 +325,46 @@ func callClaude(ctx context.Context, apiKey string, f *models.Finding) (string, 
 // Scanner factory
 // =============================================================================
 
-// buildScanners creates an AWS config from the provided static credentials,
+// validateScanRequest checks that the required credential fields are present
+// for the chosen provider.
+func validateScanRequest(req ScanRequest) error {
+	switch req.Provider {
+	case "", "aws":
+		if req.AccessKeyID == "" || req.SecretAccessKey == "" || req.Region == "" {
+			return fmt.Errorf("access_key_id, secret_access_key, and region are required for AWS")
+		}
+	case "azure":
+		if req.SubscriptionID == "" || req.ClientID == "" ||
+			req.ClientSecret == "" || req.TenantID == "" {
+			return fmt.Errorf("subscription_id, client_id, client_secret, and tenant_id are required for Azure")
+		}
+	default:
+		return fmt.Errorf("provider must be \"aws\" or \"azure\"")
+	}
+	return nil
+}
+
+// buildScanners dispatches to the correct provider's scanner factory based on
+// the provider field in the request.
+func buildScanners(ctx context.Context, req ScanRequest) ([]scanners.Scanner, error) {
+	switch req.Provider {
+	case "", "aws":
+		return buildAWSScanners(ctx, req)
+	case "azure":
+		return buildAzureScanners(ctx, req)
+	default:
+		return nil, fmt.Errorf("unknown provider: %s", req.Provider)
+	}
+}
+
+// buildAWSScanners creates an AWS config from the provided static credentials,
 // validates them via STS GetCallerIdentity, and returns a ready-to-use
 // scanner slice.
 //
 // sts:GetCallerIdentity requires no IAM permissions — any valid identity can
 // call it — so a failure here reliably means the credentials are wrong or
 // expired.
-func buildScanners(ctx context.Context, req ScanRequest) ([]scanners.Scanner, error) {
+func buildAWSScanners(ctx context.Context, req ScanRequest) ([]scanners.Scanner, error) {
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(req.Region),
 		config.WithCredentialsProvider(
@@ -353,7 +399,20 @@ func buildScanners(ctx context.Context, req ScanRequest) ([]scanners.Scanner, er
 		scanners.NewSecurityHubScanner(cfg, accountID),
 		scanners.NewLambdaScanner(cfg, accountID),
 		scanners.NewKMSScanner(cfg, accountID),
+		scanners.NewEFSScanner(cfg, accountID),
+		scanners.NewAccessAnalyzerScanner(cfg, accountID),
 	}, nil
+}
+
+// buildAzureScanners validates the Azure Service Principal credentials and
+// returns the full set of Azure scanners.
+func buildAzureScanners(ctx context.Context, req ScanRequest) ([]scanners.Scanner, error) {
+	return azure.BuildScanners(ctx, azure.Credentials{
+		SubscriptionID: req.SubscriptionID,
+		ClientID:       req.ClientID,
+		ClientSecret:   req.ClientSecret,
+		TenantID:       req.TenantID,
+	})
 }
 
 // =============================================================================

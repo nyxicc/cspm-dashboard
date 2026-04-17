@@ -31,6 +31,11 @@ const (
 // Finding represents a single security misconfiguration detected by a scanner.
 // Each Finding maps to one specific issue on one specific cloud resource.
 type Finding struct {
+	// Provider identifies which cloud platform produced this finding.
+	// "aws" for AWS scanners, "azure" for Azure scanners.
+	// Omitted from JSON when empty so existing AWS responses are unchanged.
+	Provider string `json:"provider,omitempty"`
+
 	// ID is a unique identifier for this finding (UUID).
 	ID string `json:"id"`
 
