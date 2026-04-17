@@ -80,6 +80,9 @@ func (s *S3Scanner) Scan(ctx context.Context) ([]models.Finding, error) {
 		if f, err := s.checkPublicACL(ctx, name); err == nil && f != nil {
 			findings = append(findings, *f)
 		}
+		if f, err := s.checkMFADelete(ctx, name); err == nil && f != nil {
+			findings = append(findings, *f)
+		}
 	}
 
 	return findings, nil
@@ -370,6 +373,43 @@ func (s *S3Scanner) checkPublicACL(ctx context.Context, bucket string) (*models.
 	}
 
 	return nil, nil
+}
+
+// checkMFADelete detects whether MFA Delete is enabled on the S3 bucket.
+//
+// Why it matters (S3.20):
+// MFA Delete requires the bucket owner to provide a valid MFA token in addition
+// to valid credentials when permanently deleting an object version or changing
+// versioning state. Without it, a compromised set of access keys is sufficient
+// to permanently destroy all versioned data — MFA Delete adds a physical second
+// factor that prevents this even if credentials are leaked.
+func (s *S3Scanner) checkMFADelete(ctx context.Context, bucket string) (*models.Finding, error) {
+	out, err := s.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getting versioning config for MFA delete check on %s: %w", bucket, err)
+	}
+
+	if out.MFADelete == types.MFADeleteStatusEnabled {
+		return nil, nil
+	}
+
+	return s.newFinding(bucket,
+		models.SeverityMedium,
+		"S3 bucket does not have MFA Delete enabled",
+		"MFA Delete is disabled on this bucket. Without it, permanently deleting versioned "+
+			"objects or disabling versioning requires only a valid access key — a compromised "+
+			"credential is sufficient to irreversibly destroy all object versions. MFA Delete "+
+			"adds a physical second factor that must be present for destructive operations.",
+		"Enable MFA Delete on the bucket using the root account credentials: "+
+			"'aws s3api put-bucket-versioning --bucket "+bucket+" "+
+			"--versioning-configuration Status=Enabled,MFADelete=Enabled "+
+			"--mfa \"arn:aws:iam::ACCOUNT:mfa/DEVICE TOTP_CODE\"'. "+
+			"Note: MFA Delete can only be enabled by the root account or an account with "+
+			"explicit permission, and requires an active MFA device.",
+		"S3.20",
+	), nil
 }
 
 // generateID returns a random hex string suitable for use as a finding ID.

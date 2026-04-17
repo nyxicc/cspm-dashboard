@@ -58,6 +58,12 @@ func (s *RDSScanner) Scan(ctx context.Context) ([]models.Finding, error) {
 			if f := s.checkDeletionProtection(db); f != nil {
 				findings = append(findings, *f)
 			}
+			if f := s.checkAutoMinorVersionUpgrade(db); f != nil {
+				findings = append(findings, *f)
+			}
+			if f := s.checkMultiAZ(db); f != nil {
+				findings = append(findings, *f)
+			}
 		}
 	}
 
@@ -178,6 +184,69 @@ func (s *RDSScanner) checkDeletionProtection(db rdstypes.DBInstance) *models.Fin
 				"no effect on normal operations, maintenance, or automated backups.",
 			id),
 		"",
+	)
+}
+
+// checkAutoMinorVersionUpgrade detects RDS instances with automatic minor version
+// upgrades disabled.
+//
+// Why it matters (RDS.13):
+// Minor version upgrades often include security patches for the database engine.
+// Disabling automatic upgrades means the instance may run a version with known
+// vulnerabilities indefinitely until manually patched. Automatic upgrades apply
+// during the configured maintenance window with minimal downtime.
+func (s *RDSScanner) checkAutoMinorVersionUpgrade(db rdstypes.DBInstance) *models.Finding {
+	if aws.ToBool(db.AutoMinorVersionUpgrade) {
+		return nil
+	}
+	id := aws.ToString(db.DBInstanceIdentifier)
+	return s.newFinding(db,
+		models.SeverityLow,
+		"RDS instance does not have automatic minor version upgrades enabled",
+		fmt.Sprintf(
+			"DB instance '%s' has AutoMinorVersionUpgrade=false. Minor version upgrades "+
+				"frequently include security patches. Without automatic upgrades, the instance "+
+				"may run a database engine version with known CVEs until it is manually patched.",
+			id),
+		fmt.Sprintf(
+			"Enable automatic minor version upgrades on '%s' via the RDS console or: "+
+				"'aws rds modify-db-instance --db-instance-identifier %s "+
+				"--auto-minor-version-upgrade --apply-immediately'. "+
+				"Upgrades apply during the configured maintenance window.",
+			id, id),
+		"RDS.13",
+	)
+}
+
+// checkMultiAZ detects RDS instances not deployed across multiple Availability Zones.
+//
+// Why it matters (RDS.15):
+// A single-AZ RDS instance has no automatic failover. If the Availability Zone
+// experiences an outage (hardware failure, power disruption, network partition),
+// the database is unavailable and data may be at risk. Multi-AZ provides a
+// synchronous standby replica in a different AZ with automatic failover, typically
+// completing in 1-2 minutes.
+func (s *RDSScanner) checkMultiAZ(db rdstypes.DBInstance) *models.Finding {
+	if aws.ToBool(db.MultiAZ) {
+		return nil
+	}
+	id := aws.ToString(db.DBInstanceIdentifier)
+	return s.newFinding(db,
+		models.SeverityMedium,
+		"RDS instance is not configured for Multi-AZ deployment",
+		fmt.Sprintf(
+			"DB instance '%s' is deployed in a single Availability Zone. A zone-level "+
+				"failure (hardware, power, or network) would make this database unavailable "+
+				"with no automatic failover path. Recovery would require manual intervention "+
+				"or restoring from an automated backup.",
+			id),
+		fmt.Sprintf(
+			"Enable Multi-AZ on '%s': in the RDS console modify the instance and enable "+
+				"'Multi-AZ deployment', or: 'aws rds modify-db-instance --db-instance-identifier "+
+				"%s --multi-az --apply-immediately'. Note: enabling Multi-AZ causes a brief "+
+				"failover (~60s) when applied immediately.",
+			id, id),
+		"RDS.15",
 	)
 }
 

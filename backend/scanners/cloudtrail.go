@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"cspm-dashboard/backend/models"
 )
@@ -22,6 +23,7 @@ import (
 // infrastructure itself is correctly hardened.
 type CloudTrailScanner struct {
 	client    *cloudtrail.Client
+	s3Client  *s3.Client
 	accountID string
 	region    string
 }
@@ -31,6 +33,7 @@ type CloudTrailScanner struct {
 func NewCloudTrailScanner(cfg aws.Config, accountID string) *CloudTrailScanner {
 	return &CloudTrailScanner{
 		client:    cloudtrail.NewFromConfig(cfg),
+		s3Client:  s3.NewFromConfig(cfg),
 		accountID: accountID,
 		region:    cfg.Region,
 	}
@@ -84,6 +87,9 @@ func (s *CloudTrailScanner) Scan(ctx context.Context) ([]models.Finding, error) 
 			findings = append(findings, *f)
 		}
 		if f := s.checkKMSEncryption(trail); f != nil {
+			findings = append(findings, *f)
+		}
+		if f := s.checkS3BucketLogging(ctx, trail); f != nil {
 			findings = append(findings, *f)
 		}
 	}
@@ -291,6 +297,51 @@ func (s *CloudTrailScanner) checkKMSEncryption(trail types.Trail) *models.Findin
 				"need to read audit logs (e.g., security team, SIEM ingestion role).",
 			name, name),
 		"3.7",
+	)
+}
+
+// checkS3BucketLogging detects whether the S3 bucket used to store CloudTrail
+// logs has server access logging enabled on it.
+//
+// Why it matters (CloudTrail.7 / CIS 3.6):
+// CloudTrail delivers audit logs to an S3 bucket. Without access logging on
+// that bucket, there is no record of who accessed, downloaded, or deleted
+// audit logs. An attacker who can read logs gains intelligence about defender
+// monitoring; one who can delete them can cover their tracks. S3 access logs
+// for the CloudTrail bucket create a second-order audit trail of log access itself.
+func (s *CloudTrailScanner) checkS3BucketLogging(ctx context.Context, trail types.Trail) *models.Finding {
+	bucket := aws.ToString(trail.S3BucketName)
+	if bucket == "" {
+		return nil
+	}
+
+	out, err := s.s3Client.GetBucketLogging(ctx, &s3.GetBucketLoggingInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		// Cannot check (e.g., bucket in another account) — skip.
+		return nil
+	}
+
+	if out.LoggingEnabled != nil {
+		return nil
+	}
+
+	return s.newFinding(trail,
+		models.SeverityMedium,
+		"S3 bucket for CloudTrail logs does not have server access logging enabled",
+		fmt.Sprintf(
+			"The S3 bucket '%s' storing CloudTrail logs for trail '%s' does not have "+
+				"server access logging enabled. Without it, there is no record of who accessed "+
+				"or deleted the audit logs themselves — an attacker could exfiltrate or tamper "+
+				"with logs without leaving any trace.",
+			bucket, aws.ToString(trail.Name)),
+		fmt.Sprintf(
+			"Enable server access logging on S3 bucket '%s'. Deliver logs to a separate "+
+				"dedicated logging bucket (not the CloudTrail bucket itself) so that log "+
+				"access records are stored independently. This satisfies CIS control 3.6.",
+			bucket),
+		"3.6",
 	)
 }
 

@@ -3,6 +3,7 @@ package scanners
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -56,6 +57,21 @@ func (s *EC2Scanner) Scan(ctx context.Context) ([]models.Finding, error) {
 	// CIS 3.9 — VPC flow logs must be enabled on every VPC.
 	if vpcFindings, err := s.checkVPCFlowLogs(ctx); err == nil {
 		findings = append(findings, vpcFindings...)
+	}
+
+	// EC2.7 — account-level EBS default encryption.
+	if ebsDefaultFindings, err := s.checkEBSDefaultEncryption(ctx); err == nil {
+		findings = append(findings, ebsDefaultFindings...)
+	}
+
+	// EC2.8 — IMDSv2 required on all instances.
+	if imdsFindings, err := s.checkIMDSv2(ctx); err == nil {
+		findings = append(findings, imdsFindings...)
+	}
+
+	// EC2.21 — NACLs must not allow unrestricted access to admin ports.
+	if naclFindings, err := s.checkNACLAdminPorts(ctx); err == nil {
+		findings = append(findings, naclFindings...)
 	}
 
 	return findings, nil
@@ -472,6 +488,212 @@ func (s *EC2Scanner) checkVPCFlowLogs(ctx context.Context) ([]models.Finding, er
 						"vpc-id, subnet-id, instance-id, and tcp-flags.",
 					vpcID),
 				"3.9",
+			))
+		}
+	}
+
+	return findings, nil
+}
+
+// checkEBSDefaultEncryption detects whether account-level EBS encryption by
+// default is disabled.
+//
+// Why it matters (EC2.7 / CIS 2.2.1):
+// When EBS encryption by default is enabled, every new EBS volume created in
+// the region is automatically encrypted — no per-volume setting required.
+// Without it, developers who forget to check the encryption box create
+// unencrypted volumes silently. Account-level default encryption is a safety net
+// that eliminates human error from the equation entirely.
+func (s *EC2Scanner) checkEBSDefaultEncryption(ctx context.Context) ([]models.Finding, error) {
+	out, err := s.client.GetEbsEncryptionByDefault(ctx, &ec2.GetEbsEncryptionByDefaultInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	if aws.ToBool(out.EbsEncryptionByDefault) {
+		return nil, nil
+	}
+
+	resourceID := fmt.Sprintf("arn:aws:ec2:%s:%s:account", s.region, s.accountID)
+	return []models.Finding{*s.newFinding(
+		resourceID,
+		"AWS::EC2::Region",
+		s.region,
+		models.SeverityHigh,
+		"EBS encryption by default is not enabled in this region",
+		fmt.Sprintf(
+			"Account-level EBS encryption by default is disabled in region %s. "+
+				"Any new EBS volume created without an explicit encryption setting will "+
+				"be stored in plaintext. This is a leading cause of unencrypted data at rest "+
+				"and is trivially preventable with a single account setting.",
+			s.region),
+		fmt.Sprintf(
+			"Enable EBS encryption by default in region %s: in the EC2 console under "+
+				"'Account Attributes > EBS encryption', click 'Manage' and enable it. "+
+				"Optionally specify a customer-managed KMS key for additional control. "+
+				"This only affects new volumes — existing unencrypted volumes must be "+
+				"migrated separately.",
+			s.region),
+		"2.2.1",
+	)}, nil
+}
+
+// checkIMDSv2 paginates over every EC2 instance in the region and returns a
+// finding for each one that does not require Instance Metadata Service v2.
+//
+// Why it matters (EC2.8):
+// IMDSv2 requires a session-oriented request flow — the client must first
+// obtain a session token before querying metadata. IMDSv1 (the default in
+// older accounts) allows any process on the instance to query the metadata
+// endpoint directly, including malicious code injected via SSRF. Requiring
+// IMDSv2 eliminates SSRF as a path to credential theft from the metadata service.
+func (s *EC2Scanner) checkIMDSv2(ctx context.Context) ([]models.Finding, error) {
+	var findings []models.Finding
+
+	paginator := ec2.NewDescribeInstancesPaginator(s.client, &ec2.DescribeInstancesInput{})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, reservation := range page.Reservations {
+			for _, instance := range reservation.Instances {
+				// Skip terminated instances — they are no longer running.
+				if instance.State != nil && instance.State.Name == types.InstanceStateNameTerminated {
+					continue
+				}
+
+				imdsRequired := instance.MetadataOptions != nil &&
+					instance.MetadataOptions.HttpTokens == types.HttpTokensStateRequired
+
+				if imdsRequired {
+					continue
+				}
+
+				instanceID := aws.ToString(instance.InstanceId)
+				instanceName := nameFromTags(instance.Tags, instanceID)
+
+				findings = append(findings, *s.newFinding(
+					fmt.Sprintf("arn:aws:ec2:%s:%s:instance/%s", s.region, s.accountID, instanceID),
+					"AWS::EC2::Instance",
+					instanceName,
+					models.SeverityHigh,
+					"EC2 instance does not require IMDSv2",
+					fmt.Sprintf(
+						"Instance '%s' (%s) has HttpTokens set to 'optional', meaning IMDSv1 "+
+							"is still accepted. Any process on the instance — including malicious "+
+							"code introduced via SSRF or RCE — can query the metadata endpoint "+
+							"without a session token and steal IAM role credentials.",
+						instanceName, instanceID),
+					fmt.Sprintf(
+						"Require IMDSv2 on instance '%s': "+
+							"'aws ec2 modify-instance-metadata-options --instance-id %s "+
+							"--http-tokens required --http-endpoint enabled'. "+
+							"Verify that applications running on the instance use IMDSv2 "+
+							"(SDK v2 and IMDSv2-aware tools do this automatically).",
+						instanceID, instanceID),
+					"EC2.8",
+				))
+			}
+		}
+	}
+
+	return findings, nil
+}
+
+// checkNACLAdminPorts detects Network ACL rules that allow unrestricted ingress
+// to SSH (port 22) or RDP (port 3389) from 0.0.0.0/0 or ::/0.
+//
+// Why it matters (EC2.21):
+// Unlike security groups (stateful), NACLs are stateless and apply at the subnet
+// level. A permissive NACL ingress rule on an admin port allows traffic into the
+// entire subnet before security groups can evaluate it. Removing these rules
+// forces all SSH/RDP traffic through explicit security group rules on individual
+// instances and eliminates subnet-wide exposure.
+func (s *EC2Scanner) checkNACLAdminPorts(ctx context.Context) ([]models.Finding, error) {
+	var findings []models.Finding
+
+	out, err := s.client.DescribeNetworkAcls(ctx, &ec2.DescribeNetworkAclsInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, nacl := range out.NetworkAcls {
+		naclID := aws.ToString(nacl.NetworkAclId)
+		naclName := nameFromTags(nacl.Tags, naclID)
+
+		for _, entry := range nacl.Entries {
+			// Only inspect ingress (Egress == false) allow rules.
+			if aws.ToBool(entry.Egress) {
+				continue
+			}
+			if entry.RuleAction != types.RuleActionAllow {
+				continue
+			}
+
+			// Check source CIDR.
+			cidr := aws.ToString(entry.CidrBlock)
+			ipv6Cidr := aws.ToString(entry.Ipv6CidrBlock)
+			isUnrestrictedSrc := cidr == "0.0.0.0/0" || ipv6Cidr == "::/0"
+			if !isUnrestrictedSrc {
+				continue
+			}
+
+			// Determine whether the rule covers port 22 or 3389.
+			protocol := aws.ToString(entry.Protocol)
+			allTraffic := protocol == "-1"
+
+			coversSSH := false
+			coversRDP := false
+
+			if allTraffic {
+				coversSSH = true
+				coversRDP = true
+			} else if (protocol == "6" || protocol == "tcp") && entry.PortRange != nil {
+				from := aws.ToInt32(entry.PortRange.From)
+				to := aws.ToInt32(entry.PortRange.To)
+				coversSSH = from <= 22 && 22 <= to
+				coversRDP = from <= 3389 && 3389 <= to
+			}
+
+			if !coversSSH && !coversRDP {
+				continue
+			}
+
+			var ports []string
+			if coversSSH {
+				ports = append(ports, "22 (SSH)")
+			}
+			if coversRDP {
+				ports = append(ports, "3389 (RDP)")
+			}
+			portStr := strings.Join(ports, " and ")
+
+			findings = append(findings, *s.newFinding(
+				fmt.Sprintf("arn:aws:ec2:%s:%s:network-acl/%s", s.region, s.accountID, naclID),
+				"AWS::EC2::NetworkAcl",
+				naclName,
+				models.SeverityHigh,
+				fmt.Sprintf("Network ACL allows unrestricted ingress to %s", portStr),
+				fmt.Sprintf(
+					"Network ACL '%s' (%s) has an ALLOW rule permitting ingress from %s to "+
+						"port(s) %s. NACLs apply at the subnet level before security groups, "+
+						"so this rule exposes every instance in the associated subnets to "+
+						"remote-administration attacks from the entire internet.",
+					naclName, naclID, func() string {
+						if cidr == "0.0.0.0/0" {
+							return "0.0.0.0/0"
+						}
+						return "::/0"
+					}(), portStr),
+				fmt.Sprintf(
+					"Remove or restrict the NACL ingress rule for port(s) %s in NACL '%s'. "+
+						"Replace it with rules that allow SSH/RDP only from specific trusted "+
+						"CIDR ranges (corporate VPN, bastion subnet). Consider using AWS Systems "+
+						"Manager Session Manager to eliminate the need for open admin ports entirely.",
+					portStr, naclID),
+				"EC2.21",
 			))
 		}
 	}

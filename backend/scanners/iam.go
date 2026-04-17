@@ -73,6 +73,26 @@ func (s *IAMScanner) Scan(ctx context.Context) ([]models.Finding, error) {
 		findings = append(findings, fs...)
 	}
 
+	// IAM.6 — hardware MFA for root.
+	if fs, err := s.checkRootHardwareMFA(ctx); err == nil {
+		findings = append(findings, fs...)
+	}
+
+	// IAM.18 — support role must exist.
+	if fs, err := s.checkSupportRoleExists(ctx); err == nil {
+		findings = append(findings, fs...)
+	}
+
+	// IAM.26 — expired SSL/TLS certificates.
+	if fs, err := s.checkExpiredServerCertificates(ctx); err == nil {
+		findings = append(findings, fs...)
+	}
+
+	// IAM.27 — AWSCloudShellFullAccess.
+	if fs, err := s.checkCloudShellFullAccess(ctx); err == nil {
+		findings = append(findings, fs...)
+	}
+
 	// Paginate through every IAM user once, then run all per-user checks.
 	users, err := s.listAllUsers(ctx)
 	if err != nil {
@@ -105,6 +125,9 @@ func (s *IAMScanner) Scan(ctx context.Context) ([]models.Finding, error) {
 			findings = append(findings, fs...)
 		}
 		if fs, err := s.checkPermissionsOnlyThroughGroups(ctx, username, userARN); err == nil {
+			findings = append(findings, fs...)
+		}
+		if fs, err := s.checkCredentialsUnused45Days(ctx, user); err == nil {
 			findings = append(findings, fs...)
 		}
 	}
@@ -884,4 +907,277 @@ func (s *IAMScanner) checkUserConsoleAndKeys(ctx context.Context, username, user
 			username),
 		"1.11",
 	)}, nil
+}
+
+// checkRootHardwareMFA detects whether the root account is using virtual MFA
+// instead of a hardware MFA device.
+// IAM.6: Hardware MFA should be enabled for the root user.
+func (s *IAMScanner) checkRootHardwareMFA(ctx context.Context) ([]models.Finding, error) {
+	summaryOut, err := s.client.GetAccountSummary(ctx, &iam.GetAccountSummaryInput{})
+	if err != nil {
+		return nil, err
+	}
+	// If root has no MFA at all, IAM.9 / checkRootMFA already covers it.
+	if summaryOut.SummaryMap[string(types.SummaryKeyTypeAccountMFAEnabled)] == 0 {
+		return nil, nil
+	}
+
+	// Root has MFA — determine whether it's virtual (bad) or hardware (good).
+	vMFAOut, err := s.client.ListVirtualMFADevices(ctx, &iam.ListVirtualMFADevicesInput{
+		AssignmentStatus: types.AssignmentStatusTypeAssigned,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	rootARN := fmt.Sprintf("arn:aws:iam::%s:root", s.accountID)
+	for _, device := range vMFAOut.VirtualMFADevices {
+		serial := aws.ToString(device.SerialNumber)
+		if strings.Contains(serial, ":mfa/root-account-mfa-device") {
+			return []models.Finding{s.newFinding(
+				rootARN, "AWS::IAM::Root", "root",
+				models.SeverityHigh,
+				"Root account is using virtual MFA instead of hardware MFA",
+				"The root account has a virtual MFA device enrolled. Virtual MFA is software-based "+
+					"and can be compromised if the device running the authenticator app is stolen or "+
+					"phished. Hardware MFA tokens are physically bound and cannot be remotely exfiltrated.",
+				"Replace the virtual MFA on the root account with a hardware TOTP security key "+
+					"(e.g., YubiKey or Gemalto token). Disable the virtual device after the hardware "+
+					"token is enrolled and tested.",
+				"IAM.6",
+			)}, nil
+		}
+	}
+	// Root has MFA and it is not virtual — hardware MFA is in use.
+	return nil, nil
+}
+
+// checkSupportRoleExists detects whether any IAM role has the AWSSupportAccess
+// managed policy attached, which is required to manage incidents with AWS Support.
+// IAM.18: Ensure a support role exists to manage incidents with AWS Support.
+func (s *IAMScanner) checkSupportRoleExists(ctx context.Context) ([]models.Finding, error) {
+	const supportPolicyARN = "arn:aws:iam::aws:policy/AWSSupportAccess"
+
+	paginator := iam.NewListEntitiesForPolicyPaginator(s.client, &iam.ListEntitiesForPolicyInput{
+		PolicyArn:    aws.String(supportPolicyARN),
+		EntityFilter: types.EntityTypeRole,
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(page.PolicyRoles) > 0 {
+			return nil, nil // at least one role has the policy
+		}
+	}
+
+	accountARN := fmt.Sprintf("arn:aws:iam::%s:root", s.accountID)
+	return []models.Finding{s.newFinding(
+		accountARN, "AWS::IAM::Account", "account",
+		models.SeverityMedium,
+		"No IAM role with AWSSupportAccess policy exists",
+		"No IAM role has the AWSSupportAccess managed policy attached. Without a dedicated "+
+			"support role, opening AWS Support cases requires using the root account or a "+
+			"highly-privileged user, violating least-privilege and making incident response harder.",
+		"Create an IAM role (e.g., 'AWSSupportRole') and attach the AWSSupportAccess managed policy. "+
+			"Grant only the users or groups that handle AWS Support cases permission to assume this role.",
+		"IAM.18",
+	)}, nil
+}
+
+// checkCredentialsUnused45Days detects IAM user access keys that have not been
+// used within the past 45 days (or have never been used on an account older than 45 days).
+// IAM.22: IAM user credentials unused for 45 days should be removed.
+func (s *IAMScanner) checkCredentialsUnused45Days(ctx context.Context, user types.User) ([]models.Finding, error) {
+	const threshold = 45 * 24 * time.Hour
+	var findings []models.Finding
+	username := aws.ToString(user.UserName)
+	userARN := aws.ToString(user.Arn)
+
+	// Skip users created less than 45 days ago — they may not have used keys yet.
+	if time.Since(aws.ToTime(user.CreateDate)) <= threshold {
+		return nil, nil
+	}
+
+	keysOut, err := s.client.ListAccessKeys(ctx, &iam.ListAccessKeysInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing access keys for %s: %w", username, err)
+	}
+
+	for _, key := range keysOut.AccessKeyMetadata {
+		if key.Status != types.StatusTypeActive {
+			continue
+		}
+		keyID := aws.ToString(key.AccessKeyId)
+
+		lastUsedOut, err := s.client.GetAccessKeyLastUsed(ctx, &iam.GetAccessKeyLastUsedInput{
+			AccessKeyId: aws.String(keyID),
+		})
+		if err != nil {
+			continue
+		}
+
+		var unused bool
+		if lastUsedOut.AccessKeyLastUsed == nil || lastUsedOut.AccessKeyLastUsed.LastUsedDate == nil {
+			// Key was never used — flag if the key itself is older than 45 days.
+			unused = time.Since(aws.ToTime(key.CreateDate)) > threshold
+		} else {
+			unused = time.Since(aws.ToTime(lastUsedOut.AccessKeyLastUsed.LastUsedDate)) > threshold
+		}
+
+		if unused {
+			findings = append(findings, s.newFinding(
+				userARN, "AWS::IAM::AccessKey", keyID,
+				models.SeverityMedium,
+				"IAM user access key has not been used in over 45 days",
+				fmt.Sprintf(
+					"Access key '%s' for user '%s' has not been used in over 45 days. "+
+						"Unused credentials that remain active expand the attack surface — "+
+						"a compromised key that is never checked can go undetected indefinitely.",
+					keyID, username),
+				fmt.Sprintf(
+					"Deactivate and delete access key '%s' for user '%s' if it is no longer needed. "+
+						"If the key is still required, investigate why it has gone unused — this "+
+						"may indicate a misconfigured application or a forgotten service account.",
+					keyID, username),
+				"IAM.22",
+			))
+		}
+	}
+
+	return findings, nil
+}
+
+// checkExpiredServerCertificates detects IAM server certificates that have expired.
+// IAM.26: Expired SSL/TLS certificates in IAM should be removed.
+func (s *IAMScanner) checkExpiredServerCertificates(ctx context.Context) ([]models.Finding, error) {
+	var findings []models.Finding
+	now := time.Now().UTC()
+
+	paginator := iam.NewListServerCertificatesPaginator(s.client, &iam.ListServerCertificatesInput{})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, cert := range page.ServerCertificateMetadataList {
+			expiry := aws.ToTime(cert.Expiration)
+			if expiry.IsZero() || !now.After(expiry) {
+				continue // not expired
+			}
+
+			certARN := aws.ToString(cert.Arn)
+			certName := aws.ToString(cert.ServerCertificateName)
+
+			findings = append(findings, s.newFinding(
+				certARN, "AWS::IAM::ServerCertificate", certName,
+				models.SeverityHigh,
+				"Expired SSL/TLS certificate found in IAM",
+				fmt.Sprintf(
+					"Server certificate '%s' expired on %s. Expired certificates stored in IAM "+
+						"may be accidentally served by load balancers or applications, causing "+
+						"TLS handshake failures or, worse, silent acceptance of expired credentials "+
+						"by misconfigured clients.",
+					certName, expiry.Format("2006-01-02")),
+				fmt.Sprintf(
+					"Delete expired certificate '%s' from IAM: "+
+						"'aws iam delete-server-certificate --server-certificate-name %s'. "+
+						"If the certificate is still in use by a resource, upload a renewed "+
+						"certificate first and update the resource to reference the new one before deleting.",
+					certName, certName),
+				"IAM.26",
+			))
+		}
+	}
+
+	return findings, nil
+}
+
+// checkCloudShellFullAccess detects IAM identities with the AWSCloudShellFullAccess
+// policy attached.
+// IAM.27: IAM identities should not have AWSCloudShellFullAccess attached.
+func (s *IAMScanner) checkCloudShellFullAccess(ctx context.Context) ([]models.Finding, error) {
+	const cloudShellPolicyARN = "arn:aws:iam::aws:policy/AWSCloudShellFullAccess"
+	var findings []models.Finding
+
+	paginator := iam.NewListEntitiesForPolicyPaginator(s.client, &iam.ListEntitiesForPolicyInput{
+		PolicyArn: aws.String(cloudShellPolicyARN),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, u := range page.PolicyUsers {
+			name := aws.ToString(u.UserName)
+			arn := fmt.Sprintf("arn:aws:iam::%s:user/%s", s.accountID, name)
+			findings = append(findings, s.newFinding(
+				arn, "AWS::IAM::User", name,
+				models.SeverityMedium,
+				"IAM user has AWSCloudShellFullAccess policy attached",
+				fmt.Sprintf(
+					"User '%s' has AWSCloudShellFullAccess attached. CloudShell provides an "+
+						"internet-accessible browser-based shell with pre-configured AWS CLI "+
+						"access. Broad assignment can be exploited to exfiltrate credentials, "+
+						"enumerate resources, or move laterally using the session's permissions.",
+					name),
+				fmt.Sprintf(
+					"Remove AWSCloudShellFullAccess from user '%s'. If CloudShell access is "+
+						"genuinely required, grant it only through an IAM group with a documented "+
+						"justification, and scope access via a permission boundary.",
+					name),
+				"IAM.27",
+			))
+		}
+
+		for _, g := range page.PolicyGroups {
+			name := aws.ToString(g.GroupName)
+			arn := fmt.Sprintf("arn:aws:iam::%s:group/%s", s.accountID, name)
+			findings = append(findings, s.newFinding(
+				arn, "AWS::IAM::Group", name,
+				models.SeverityMedium,
+				"IAM group has AWSCloudShellFullAccess policy attached",
+				fmt.Sprintf(
+					"Group '%s' has AWSCloudShellFullAccess attached, granting CloudShell "+
+						"access to all members of the group. Any member can use CloudShell "+
+						"to exfiltrate credentials or data using the group's permissions.",
+					name),
+				fmt.Sprintf(
+					"Remove AWSCloudShellFullAccess from group '%s'. Audit group members "+
+						"who may have been relying on this access and grant CloudShell only "+
+						"where explicitly justified.",
+					name),
+				"IAM.27",
+			))
+		}
+
+		for _, r := range page.PolicyRoles {
+			name := aws.ToString(r.RoleName)
+			arn := fmt.Sprintf("arn:aws:iam::%s:role/%s", s.accountID, name)
+			findings = append(findings, s.newFinding(
+				arn, "AWS::IAM::Role", name,
+				models.SeverityMedium,
+				"IAM role has AWSCloudShellFullAccess policy attached",
+				fmt.Sprintf(
+					"Role '%s' has AWSCloudShellFullAccess attached. Any principal that can "+
+						"assume this role also inherits CloudShell access, which could be "+
+						"exploited for credential exfiltration or lateral movement.",
+					name),
+				fmt.Sprintf(
+					"Remove AWSCloudShellFullAccess from role '%s'. Evaluate whether any "+
+						"service or user legitimately requires CloudShell through this role.",
+					name),
+				"IAM.27",
+			))
+		}
+	}
+
+	return findings, nil
 }
